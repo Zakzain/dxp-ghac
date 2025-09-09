@@ -1,197 +1,30 @@
-name: ABC-GHAC Sweeper (bump + PRs)
+name: Sweep abc-ghac usage
 
 on:
   workflow_dispatch:
     inputs:
       target_ref:
-        description: "Desired reference for abc-ghac (e.g., v3 or v3.0.0)"
+        description: "Target version/ref of abc-ghac (e.g. v3)"
         required: true
         default: "v3"
-      include_forks:
-        description: "Also process forks?"
-        required: true
-        default: "false"
-  schedule:
-    - cron: "17 6 * * 1"  # Mondays 06:17 UTC
 
 permissions:
   contents: write
   pull-requests: write
 
-concurrency:
-  group: abc-ghac-sweeper
-  cancel-in-progress: false
-
-env:
-  ORG: your-org                   # <-- change me
-  ACTION_REPO: your-org/abc-ghac  # <-- change me
-  BRANCH_PREFIX: chore/bump-abc-ghac-
-  GH_TOKEN: ${{ secrets.Token1 }}
-
 jobs:
-  sweep:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
     steps:
-      - name: Checkout control repo (for logs/artifacts)
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install jq (for JSON processing)
+      - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: List repositories in org
-        id: list
-        shell: bash
+      - name: Example GH call
+        env:
+          GH_TOKEN: ${{ secrets.PERSONAL_ADMIN_TOKEN }}
         run: |
-          set -euo pipefail
-          # Pull all repos (paginate)
-          page=1
-          repos_json="[]"
-          while :; do
-            resp=$(gh api -X GET "orgs/${ORG}/repos?per_page=100&page=${page}")
-            count=$(echo "$resp" | jq 'length')
-            repos_json=$(jq -cs '.[0] + .[1]' <(echo "$repos_json") <(echo "$resp"))
-            [[ "$count" -lt 100 ]] && break
-            page=$((page+1))
-          done
-
-          # Filter: active, not archived/disabled, not template, (optionally) exclude forks
-          if [[ "${{ github.event.inputs.include_forks }}" == "true" ]]; then
-            repos=$(echo "$repos_json" | jq -r '.[] | select(.archived==false and .disabled==false and .is_template==false) | .full_name')
-          else
-            repos=$(echo "$repos_json" | jq -r '.[] | select(.archived==false and .disabled==false and .is_template==false and .fork==false) | .full_name')
-          fi
-
-          if [[ -z "$repos" ]]; then
-            echo "No repositories to process." >&2
-          fi
-
-          echo "$repos" > repos.txt
-          echo "repo_count=$(wc -l < repos.txt | tr -d " ")" >> "$GITHUB_OUTPUT"
-          echo "Listed repositories:"
-          wc -l repos.txt
-          head -n 20 repos.txt || true
-
-      - name: Sweep and open PRs
-        if: steps.list.outputs.repo_count != '0'
-        shell: bash
-        run: |
-          set -euo pipefail
-          TARGET_REF="${{ github.event.inputs.target_ref || 'v3' }}"
-          BRANCH="${BRANCH_PREFIX}${TARGET_REF}"
-          TMPDIR="$(mktemp -d)"
-          REPORT="$GITHUB_WORKSPACE/abc-ghac-report.csv"
-          echo "repo,path,from,to,pr_url" > "$REPORT"
-
-          while IFS= read -r repo; do
-            echo "::group::Processing $repo"
-            def_branch=$(gh repo view "$repo" --json defaultBranchRef -q .defaultBranchRef.name || echo "main")
-
-            # Quick check via code search to avoid cloning repos with no references
-            hits=$(gh search code "uses: ${ACTION_REPO}@" --repo "$repo" --json path -q 'length')
-            if [[ "$hits" -eq 0 ]]; then
-              echo "No abc-ghac references found. Skipping clone."
-              echo "$repo,,none,none," >> "$REPORT"
-              echo "::endgroup::"
-              continue
-            fi
-
-            work="$TMPDIR/$(echo "$repo" | tr '/:' '__')"
-            git clone --quiet --depth 1 --branch "$def_branch" "https://github.com/$repo.git" "$work" || { echo "Clone failed"; echo "::endgroup::"; continue; }
-            cd "$work"
-
-            # Create/refresh branch
-            if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
-              git checkout -q "$BRANCH"
-              git reset --hard "origin/$def_branch"
-              git rebase "origin/$def_branch" || true
-            else
-              git checkout -q -b "$BRANCH"
-            fi
-
-            # Find candidate workflow files
-            mapfile -t files < <(find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null || true)
-            if [[ ${#files[@]} -eq 0 ]]; then
-              echo "No workflow files."
-              cd - >/dev/null
-              echo "::endgroup::"
-              continue
-            fi
-
-            changed=0
-            for f in "${files[@]}"; do
-              if grep -q "${ACTION_REPO}@" "$f"; then
-                before=$(grep -n "${ACTION_REPO}@" "$f" || true)
-
-                # If already on TARGET_REF, skip file
-                if grep -q "${ACTION_REPO}@${TARGET_REF}\b" "$f"; then
-                  echo "Already on ${TARGET_REF}: $f"
-                  continue
-                fi
-
-                # Replace only the token after '@'
-                perl -0777 -pe 's|(uses:\s*'"${ACTION_REPO//\//\\/}"'\s*@)[A-Za-z0-9._-]+|\1'"${TARGET_REF//\//\\/}"'|g' -i "$f"
-
-                after=$(grep -n "${ACTION_REPO}@" "$f" || true)
-                if [[ "$before" != "$after" ]]; then
-                  echo "Updated: $f"
-                  changed=1
-                  # For report, try to capture first from/to
-                  FROM=$(echo "$before" | head -n1 | sed -E 's/.*'"${ACTION_REPO//\//\\/}"'@([A-Za-z0-9._-]+).*/\1/' || true)
-                  echo "$repo,$f,${FROM:-unknown},$TARGET_REF," >> "$REPORT"
-                fi
-              fi
-            done
-
-            if [[ $changed -eq 0 ]]; then
-              echo "No changes needed."
-              cd - >/dev/null
-              echo "::endgroup::"
-              continue
-            fi
-
-            git add -A
-            if git diff --cached --quiet; then
-              echo "Nothing staged; skipping."
-              cd - >/dev/null
-              echo "::endgroup::"
-              continue
-            fi
-
-            git -c user.name="gh-automation" -c user.email="actions@users.noreply.github.com" commit -m "chore: bump ${ACTION_REPO} to ${TARGET_REF}"
-            git push -u origin "$BRANCH"
-
-            # Avoid duplicate PRs
-            if gh pr list --repo "$repo" --search "bump ${ACTION_REPO} to ${TARGET_REF} in:title" --state open --json number -q 'length>0' >/dev/null 2>&1; then
-              echo "PR already open."
-              cd - >/dev/null
-              echo "::endgroup::"
-              continue
-            fi
-
-            pr_url=$(gh pr create \
-              --repo "$repo" \
-              --title "chore: bump ${ACTION_REPO} to ${TARGET_REF}" \
-              --body "Automated update to \`${ACTION_REPO}@${TARGET_REF}\`. Please verify CI." \
-              --base "$def_branch" \
-              --head "$BRANCH" \
-              --json url -q .url || true)
-
-            if [[ -n "$pr_url" ]]; then
-              # Update last report row for this repo with PR URL
-              tmp=$(mktemp)
-              awk -F, -v repo="$repo" -v pr="$pr_url" 'BEGIN{OFS=","} {if($1==repo && $5=="") {$5=pr} print}' "$REPORT" > "$tmp" && mv "$tmp" "$REPORT"
-              echo "Opened PR: $pr_url"
-            else
-              echo "Failed to open PR (branch remains)."
-            fi
-
-            cd - >/dev/null
-            echo "::endgroup::"
-          done
-
-      - name: Upload report
-        uses: actions/upload-artifact@v4
-        with:
-          name: abc-ghac-report
-          path: abc-ghac-report.csv
+          # Example: list your repos
+          gh repo list $GITHUB_ACTOR --json nameWithOwner -L 10
