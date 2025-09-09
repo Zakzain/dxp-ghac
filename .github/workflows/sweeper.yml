@@ -36,8 +36,8 @@ concurrency:
 
 env:
   # CHANGE ME: set to your username and action repo
-  USER_OWNER: ${{ Zakzain.actor }}
-  ACTION_REPO: "Zakzain/abc-ghac"   # <-- change to your actual action path
+  USER_OWNER: ${{Zakzain}}
+  ACTION_REPO: "Zakzain/dxp-ghac"   # <-- change to your actual action path
   BRANCH_PREFIX: "chore/bump-abc-ghac-"
   GH_TOKEN: ${{ secrets.PAT }}
 
