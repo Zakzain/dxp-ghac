@@ -26,7 +26,7 @@ env:
   ORG: your-org                   # <-- change me
   ACTION_REPO: your-org/abc-ghac  # <-- change me
   BRANCH_PREFIX: chore/bump-abc-ghac-
-  GH_TOKEN: ${{ secrets.PAT }}
+  GH_TOKEN: ${{ secrets.Token1 }}
 
 jobs:
   sweep:
