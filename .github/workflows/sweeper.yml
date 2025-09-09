@@ -64,7 +64,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Pull repos for the personal account (handles pagination via -L)
+          # Pull repos for the personal account (pagination via -L)
           gh repo list "$USER_OWNER" \
             --json nameWithOwner,isFork,isArchived,isTemplate,isPrivate,visibility \
             -L 1000 > repos.json
@@ -92,7 +92,169 @@ jobs:
           REPO_COUNT=$(wc -l < repos_filtered.txt | tr -d ' ')
           echo "repo_count=${REPO_COUNT}" >> "$GITHUB_OUTPUT"
           echo "---- Repos to process (${REPO_COUNT}) ----"
-          head -n 30 repos_filtered.txt || true
+          cat repos_filtered.txt
+
+      - name: Sweep and open PRs
+        if: steps.list.outputs.repo_count != '0'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          ACTION_REPO: "${{ env.ACTION_REPO }}"
+          TARGET_REF: ${{ github.event.inputs.target_ref || 'v3' }}
+        run: |
+          set -euo pipefail
+
+          BRANCH_PREFIX="chore/bump-dxp-ghac-"
+          BRANCH="${BRANCH_PREFIX}${TARGET_REF}"
+          TMPDIR="$(mktemp -d)"
+          REPORT="$GITHUB_WORKSPACE/dxp-ghac-report.csv"
+          echo "repo,status,found_refs,changed_files,from,to,pr_url" > "$REPORT"
+
+          while IFS= read -r repo; do
+            echo "::group::Processing $repo"
+
+            # 1) Broad discovery: allow both fully-qualified and bare action names
+            #    - exact:  uses: <owner>/dxp-ghac@...
+            #    - loose:  dxp-ghac@...
+            hits_exact=$(gh search code "uses: ${ACTION_REPO}@" --repo "$repo" --json path -q 'length' || echo 0)
+            hits_loose=$(gh search code "dxp-ghac@" --repo "$repo" --json path -q 'length' || echo 0)
+            hits=$((hits_exact + hits_loose))
+            echo "Discovery: exact=${hits_exact}, loose=${hits_loose}, total=${hits}"
+
+            # Default-branch (fallback to main)
+            def_branch=$(gh repo view "$repo" --json defaultBranchRef -q .defaultBranchRef.name || echo "main")
+
+            # If no references found at all, record and continue
+            if [[ "$hits" -eq 0 ]]; then
+              echo "No references to dxp-ghac found."
+              echo "$repo,no_refs,0,0,,," >> "$REPORT"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # 2) Authenticated clone (so private repos & pushes work)
+            work="$TMPDIR/$(echo "$repo" | tr '/:' '__')"
+            origin_url="https://x-access-token:${GH_TOKEN}@github.com/${repo}.git"
+            git clone --quiet --depth 1 --branch "$def_branch" "$origin_url" "$work" || { 
+              echo "Clone failed (check PAT scopes)."
+              echo "$repo,clone_failed,$hits,0,,," >> "$REPORT"
+              echo "::endgroup::"
+              continue
+            }
+            cd "$work"
+
+            # 3) Prepare branch
+            if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+              git checkout -q "$BRANCH"
+              git reset --hard "origin/$def_branch"
+              git rebase "origin/$def_branch" || true
+            else
+              git checkout -q -b "$BRANCH"
+            fi
+
+            # 4) Find workflow files (common location for actions)
+            mapfile -t files < <(find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null || true)
+            if [[ ${#files[@]} -eq 0 ]]; then
+              echo "No workflow files present."
+              echo "$repo,no_workflows,$hits,0,,," >> "$REPORT"
+              cd - >/dev/null
+              echo "::endgroup::"
+              continue
+            fi
+
+            changed=0
+            changed_files=0
+            from_ver=""
+
+            for f in "${files[@]}"; do
+              # Look for any dxp-ghac usage
+              if ! grep -q "dxp-ghac@" "$f"; then
+                continue
+              fi
+
+              # If already on target_ref (either qualified or bare), skip this file
+              if grep -Eq "(uses:\s*${ACTION_REPO}@${TARGET_REF}\b|dxp-ghac@${TARGET_REF}\b)" "$f"; then
+                echo "Already on ${TARGET_REF}: $f"
+                continue
+              fi
+
+              before=$(grep -n "dxp-ghac@" "$f" || true)
+
+              # Replace the token AFTER '@' for both fully-qualified and bare forms
+              #  a) uses: owner/dxp-ghac@X -> uses: owner/dxp-ghac@TARGET_REF
+              perl -0777 -pe 's|(uses:\s*'"${ACTION_REPO//\//\\/}"'\s*@)[A-Za-z0-9._-]+|\1'"${TARGET_REF//\//\\/}"'|g' -i "$f"
+              #  b) bare: dxp-ghac@X -> dxp-ghac@TARGET_REF (handles comments or other contexts)
+              perl -0777 -pe 's|(dxp-ghac@)[A-Za-z0-9._-]+|\1'"${TARGET_REF//\//\\/}"'|g' -i "$f"
+
+              after=$(grep -n "dxp-ghac@" "$f" || true)
+              if [[ "$before" != "$after" ]]; then
+                echo "Updated: $f"
+                changed=1
+                changed_files=$((changed_files+1))
+                # Capture a "from" version if we can
+                fv=$(echo "$before" | sed -nE 's/.*dxp-ghac@([A-Za-z0-9._-]+).*/\1/p' | head -n1 || true)
+                [[ -n "$fv" && -z "$from_ver" ]] && from_ver="$fv"
+              fi
+            done
+
+            if [[ $changed -eq 0 ]]; then
+              echo "No changes needed (all matches already on target or non-editable)."
+              echo "$repo,no_change,$hits,0,,," >> "$REPORT"
+              cd - >/dev/null
+              echo "::endgroup::"
+              continue
+            fi
+
+            git config user.name "gh-automation"
+            git config user.email "actions@users.noreply.github.com"
+            git add -A
+            if git diff --cached --quiet; then
+              echo "Nothing staged; skipping."
+              echo "$repo,nothing_staged,$hits,0,,," >> "$REPORT"
+              cd - >/dev/null
+              echo "::endgroup::"
+              continue
+            fi
+
+            git commit -m "chore: bump dxp-ghac to ${TARGET_REF}"
+            # Ensure push uses PAT remote
+            git push -u "$origin_url" "$BRANCH"
+
+            # Avoid duplicate PRs
+            if gh pr list --repo "$repo" --search "bump dxp-ghac to ${TARGET_REF} in:title" --state open --json number -q 'length>0' >/dev/null 2>&1; then
+              echo "PR already open."
+              echo "$repo,pr_exists,$hits,$changed_files,$from_ver,$TARGET_REF," >> "$REPORT"
+              cd - >/dev/null
+              echo "::endgroup::"
+              continue
+            fi
+
+            pr_url=$(gh pr create \
+              --repo "$repo" \
+              --title "chore: bump dxp-ghac to ${TARGET_REF}" \
+              --body "Automated update to \`dxp-ghac@${TARGET_REF}\`. Please verify CI." \
+              --base "$def_branch" \
+              --head "$BRANCH" \
+              --json url -q .url || true)
+
+            if [[ -n "$pr_url" ]]; then
+              echo "Opened PR: $pr_url"
+              echo "$repo,pr_opened,$hits,$changed_files,$from_ver,$TARGET_REF,$pr_url" >> "$REPORT"
+            else
+              echo "Failed to open PR (branch remains)."
+              echo "$repo,pr_failed,$hits,$changed_files,$from_ver,$TARGET_REF," >> "$REPORT"
+            fi
+
+            cd - >/dev/null
+            echo "::endgroup::"
+          done
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxp-ghac-report
+          path: dxp-ghac-report.csv
+
 
       - name: Sweep and open PRs
         if: steps.list.outputs.repo_count != '0'
