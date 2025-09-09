@@ -52,7 +52,7 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: List candidate repositories
+            - name: List candidate repositories
         id: list
         shell: bash
         env:
@@ -60,39 +60,33 @@ jobs:
           INCLUDE_PRIVATE: ${{ github.event.inputs.include_private }}
           INCLUDE_GLOB: ${{ github.event.inputs.repo_include_glob }}
           EXCLUDE_GLOB: ${{ github.event.inputs.repo_exclude_glob }}
+          USER_OWNER: "${{ env.USER_OWNER }}"
         run: |
           set -euo pipefail
 
-          # Pull all repos for the authenticated user
-          # gh repo list handles pagination with -L
+          # Pull repos for the personal account (handles pagination via -L)
           gh repo list "$USER_OWNER" \
-            --json nameWithOwner,isFork,isArchived,isDisabled,isTemplate,isPrivate,visibility \
+            --json nameWithOwner,isFork,isArchived,isTemplate,isPrivate,visibility \
             -L 1000 > repos.json
 
-          # Filter
-          jq_filter='
+          # Filter: not archived, not template; then apply fork/private switches
+          jq -r '
             .[]
-            | select(.isArchived == false and .isDisabled == false and .isTemplate == false)
-          '
+            | select(.isArchived == false and .isTemplate == false)
+            | select("'"${INCLUDE_FORKS}"'" == "true" or .isFork == false)
+            | select("'"${INCLUDE_PRIVATE}"'" == "true" or .isPrivate == false)
+            | .nameWithOwner
+          ' repos.json > repos_all.txt
 
-          if [[ "${INCLUDE_FORKS}" != "true" ]]; then
-            jq_filter+=' | select(.isFork == false)'
-          fi
-
-          if [[ "${INCLUDE_PRIVATE}" != "true" ]]; then
-            jq_filter+=' | select(.isPrivate == false)'
-          fi
-
-          jq -r "$jq_filter | .nameWithOwner" repos.json > repos_all.txt
-
-          # Apply include/exclude globs if provided
+          # Apply include/exclude globs (optional)
           cp repos_all.txt repos_filtered.txt
           if [[ -n "${INCLUDE_GLOB}" ]]; then
-            grep -E "/${INCLUDE_GLOB//\*/.*}$" repos_all.txt > repos_filtered.txt || true
+            grep -E "/${INCLUDE_GLOB//\*/.*}$" repos_filtered.txt > repos_tmp.txt || true
+            mv repos_tmp.txt repos_filtered.txt
           fi
           if [[ -n "${EXCLUDE_GLOB}" ]]; then
-            grep -Ev "/${EXCLUDE_GLOB//\*/.*}$" repos_filtered.txt > repos_filtered2.txt || true
-            mv repos_filtered2.txt repos_filtered.txt
+            grep -Ev "/${EXCLUDE_GLOB//\*/.*}$" repos_filtered.txt > repos_tmp.txt || true
+            mv repos_tmp.txt repos_filtered.txt
           fi
 
           REPO_COUNT=$(wc -l < repos_filtered.txt | tr -d ' ')
