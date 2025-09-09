@@ -1,30 +1,229 @@
-name: Sweep abc-ghac usage
+name: ABC-GHAC Sweeper (personal)
 
 on:
   workflow_dispatch:
     inputs:
       target_ref:
-        description: "Target version/ref of abc-ghac (e.g. v3)"
+        description: "Desired reference for abc-ghac (e.g., v3 or v3.0.2)"
         required: true
         default: "v3"
+      include_forks:
+        description: "Process forked repos?"
+        required: true
+        default: "false"
+      include_private:
+        description: "Include private repos (requires PAT access)?"
+        required: true
+        default: "true"
+      repo_include_glob:
+        description: "Only include repos matching this glob (e.g., 'proj-*'). Leave blank for all."
+        required: false
+        default: ""
+      repo_exclude_glob:
+        description: "Exclude repos matching this glob (e.g., 'archived-*'). Leave blank for none."
+        required: false
+        default: ""
+  schedule:
+    - cron: "23 5 * * 1" # Mondays 05:23 UTC
 
 permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: abc-ghac-sweeper
+  cancel-in-progress: false
+
+env:
+  # CHANGE ME: set to your username and action repo
+  USER_OWNER: ${{ Zakzain.actor }}
+  ACTION_REPO: "Zakzain/abc-ghac"   # <-- change to your actual action path
+  BRANCH_PREFIX: "chore/bump-abc-ghac-"
+  GH_TOKEN: ${{ secrets.PAT }}
+
 jobs:
-  check:
+  sweep:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+
     steps:
-      - name: Checkout
+      - name: Checkout (control repo)
         uses: actions/checkout@v4
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Example GH call
+      - name: List candidate repositories
+        id: list
+        shell: bash
         env:
-          GH_TOKEN: ${{ secrets.PAT }}
+          INCLUDE_FORKS: ${{ github.event.inputs.include_forks }}
+          INCLUDE_PRIVATE: ${{ github.event.inputs.include_private }}
+          INCLUDE_GLOB: ${{ github.event.inputs.repo_include_glob }}
+          EXCLUDE_GLOB: ${{ github.event.inputs.repo_exclude_glob }}
         run: |
-          # Example: list your repos
-          gh repo list $GITHUB_ACTOR --json nameWithOwner -L 10
+          set -euo pipefail
+
+          # Pull all repos for the authenticated user
+          # gh repo list handles pagination with -L
+          gh repo list "$USER_OWNER" \
+            --json nameWithOwner,isFork,isArchived,isDisabled,isTemplate,isPrivate,visibility \
+            -L 1000 > repos.json
+
+          # Filter
+          jq_filter='
+            .[]
+            | select(.isArchived == false and .isDisabled == false and .isTemplate == false)
+          '
+
+          if [[ "${INCLUDE_FORKS}" != "true" ]]; then
+            jq_filter+=' | select(.isFork == false)'
+          fi
+
+          if [[ "${INCLUDE_PRIVATE}" != "true" ]]; then
+            jq_filter+=' | select(.isPrivate == false)'
+          fi
+
+          jq -r "$jq_filter | .nameWithOwner" repos.json > repos_all.txt
+
+          # Apply include/exclude globs if provided
+          cp repos_all.txt repos_filtered.txt
+          if [[ -n "${INCLUDE_GLOB}" ]]; then
+            grep -E "/${INCLUDE_GLOB//\*/.*}$" repos_all.txt > repos_filtered.txt || true
+          fi
+          if [[ -n "${EXCLUDE_GLOB}" ]]; then
+            grep -Ev "/${EXCLUDE_GLOB//\*/.*}$" repos_filtered.txt > repos_filtered2.txt || true
+            mv repos_filtered2.txt repos_filtered.txt
+          fi
+
+          REPO_COUNT=$(wc -l < repos_filtered.txt | tr -d ' ')
+          echo "repo_count=${REPO_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "---- Repos to process (${REPO_COUNT}) ----"
+          head -n 30 repos_filtered.txt || true
+
+      - name: Sweep and open PRs
+        if: steps.list.outputs.repo_count != '0'
+        shell: bash
+        env:
+          TARGET_REF: ${{ github.event.inputs.target_ref || 'v3' }}
+        run: |
+          set -euo pipefail
+
+          BRANCH="${BRANCH_PREFIX}${TARGET_REF}"
+          TMPDIR="$(mktemp -d)"
+          REPORT="$GITHUB_WORKSPACE/abc-ghac-report.csv"
+          echo "repo,path,from,to,pr_url" > "$REPORT"
+
+          while IFS= read -r repo; do
+            echo "::group::Processing $repo"
+
+            # Quick skip if the action never appears (saves cloning)
+            hits=$(gh search code "uses: ${ACTION_REPO}@" --repo "$repo" --json path -q 'length' || echo 0)
+            if [[ "$hits" -eq 0 ]]; then
+              echo "No references found for ${ACTION_REPO}@ in $repo. Skipping."
+              echo "$repo,,none,none," >> "$REPORT"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Determine default branch
+            def_branch=$(gh repo view "$repo" --json defaultBranchRef -q .defaultBranchRef.name || echo "main")
+
+            work="$TMPDIR/$(echo "$repo" | tr '/:' '__')"
+            git clone --quiet --depth 1 --branch "$def_branch" "https://github.com/$repo.git" "$work" || { echo "Clone failed"; echo "::endgroup::"; continue; }
+            cd "$work"
+
+            # Create/refresh working branch
+            if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+              git checkout -q "$BRANCH"
+              git reset --hard "origin/$def_branch"
+              git rebase "origin/$def_branch" || true
+            else
+              git checkout -q -b "$BRANCH"
+            fi
+
+            # Find workflows
+            mapfile -t files < <(find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null || true)
+            if [[ ${#files[@]} -eq 0 ]]; then
+              echo "No workflow files."
+              cd - >/dev/null
+              echo "::endgroup::"
+              continue
+            fi
+
+            changed=0
+            for f in "${files[@]}"; do
+              if grep -q "${ACTION_REPO}@" "$f"; then
+                # Already on target?
+                if grep -q "${ACTION_REPO}@${TARGET_REF}\b" "$f"; then
+                  echo "Already on ${TARGET_REF}: $f"
+                  continue
+                fi
+
+                before=$(grep -n "${ACTION_REPO}@" "$f" || true)
+
+                # Replace only the token after '@'
+                perl -0777 -pe 's|(uses:\s*'"${ACTION_REPO//\//\\/}"'\s*@)[A-Za-z0-9._-]+|\1'"${TARGET_REF//\//\\/}"'|g' -i "$f"
+
+                after=$(grep -n "${ACTION_REPO}@" "$f" || true)
+                if [[ "$before" != "$after" ]]; then
+                  echo "Updated: $f"
+                  changed=1
+                  FROM=$(echo "$before" | head -n1 | sed -E 's/.*'"${ACTION_REPO//\//\\/}"'@([A-Za-z0-9._-]+).*/\1/' || true)
+                  echo "$repo,$f,${FROM:-unknown},$TARGET_REF," >> "$REPORT"
+                fi
+              fi
+            done
+
+            if [[ $changed -eq 0 ]]; then
+              echo "No changes needed."
+              cd - >/dev/null
+              echo "::endgroup::"
+              continue
+            fi
+
+            git add -A
+            if git diff --cached --quiet; then
+              echo "Nothing staged; skipping."
+              cd - >/dev/null
+              echo "::endgroup::"
+              continue
+            fi
+
+            git -c user.name="gh-automation" -c user.email="actions@users.noreply.github.com" commit -m "chore: bump ${ACTION_REPO} to ${TARGET_REF}"
+            git push -u origin "$BRANCH"
+
+            # Avoid duplicate PRs
+            if gh pr list --repo "$repo" --search "bump ${ACTION_REPO} to ${TARGET_REF} in:title" --state open --json number -q 'length>0' >/dev/null 2>&1; then
+              echo "PR already open."
+              cd - >/dev/null
+              echo "::endgroup::"
+              continue
+            fi
+
+            pr_url=$(gh pr create \
+              --repo "$repo" \
+              --title "chore: bump ${ACTION_REPO} to ${TARGET_REF}" \
+              --body "Automated update to \`${ACTION_REPO}@${TARGET_REF}\`. Please verify CI." \
+              --base "$def_branch" \
+              --head "$BRANCH" \
+              --json url -q .url || true)
+
+            if [[ -n "$pr_url" ]]; then
+              # Patch last row for this repo with PR URL
+              tmp=$(mktemp)
+              awk -F, -v repo="$repo" -v pr="$pr_url" 'BEGIN{OFS=","} {if($1==repo && $5=="") {$5=pr} print}' "$REPORT" > "$tmp" && mv "$tmp" "$REPORT"
+              echo "Opened PR: $pr_url"
+            else
+              echo "Failed to open PR (branch remains)."
+            fi
+
+            cd - >/dev/null
+            echo "::endgroup::"
+          done
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: abc-ghac-report
+          path: abc-ghac-report.csv
