@@ -24,7 +24,7 @@ jobs:
 
       - name: Example GH call
         env:
-          GH_TOKEN: ${{ secrets.PERSONAL_ADMIN_TOKEN }}
+          GH_TOKEN: ${{ secrets.Token1 }}
         run: |
           # Example: list your repos
           gh repo list $GITHUB_ACTOR --json nameWithOwner -L 10
